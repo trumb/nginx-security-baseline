@@ -1,0 +1,126 @@
+name: 'Nginx Security Baseline Check'
+description: 'Validates that nginx configs include the security hardening snippet and that Dockerfiles install fail2ban'
+inputs:
+  nginx-config-glob:
+    description: 'Glob pattern to find nginx config files'
+    required: false
+    default: '**/*.conf **/nginx*.conf **/sites-available/* **/sites-enabled/*'
+  dockerfile-glob:
+    description: 'Glob pattern to find Dockerfiles'
+    required: false
+    default: '**/Dockerfile*'
+  check-fail2ban:
+    description: 'Whether to check that Dockerfiles include fail2ban setup'
+    required: false
+    default: 'false'
+  security-snippet-path:
+    description: 'Expected include path in nginx configs'
+    required: false
+    default: '/etc/nginx/snippets/security-hardening.conf'
+runs:
+  using: 'composite'
+  steps:
+    - name: Check nginx configs for security baseline
+      shell: bash
+      run: |
+        FAILED=0
+        CHECKED=0
+        SNIPPET_PATH="${{ inputs.security-snippet-path }}"
+
+        echo "::group::Scanning for nginx configuration files"
+
+        # Find nginx config files (excluding the snippet itself and node_modules)
+        CONFIGS=$(find . -type f \( -name "*.conf" -o -name "default" \) \
+          -not -path "*/node_modules/*" \
+          -not -path "*/.git/*" \
+          -not -path "*/security-hardening*" \
+          -not -path "*/fail2ban/*" \
+          -not -path "*/snippets/*" \
+          2>/dev/null || true)
+
+        for config in $CONFIGS; do
+          # Skip files that don't look like nginx server configs
+          if ! grep -q "server\s*{" "$config" 2>/dev/null; then
+            continue
+          fi
+
+          # Skip upstream-only or map-only configs (no server blocks serving content)
+          if ! grep -qE "listen\s+" "$config" 2>/dev/null; then
+            continue
+          fi
+
+          CHECKED=$((CHECKED + 1))
+
+          # Check for the security include
+          if grep -q "include.*security-hardening" "$config"; then
+            echo "✅ $config — includes security baseline"
+          else
+            echo "❌ $config — MISSING security baseline include"
+            echo "   Expected: include $SNIPPET_PATH;"
+            FAILED=$((FAILED + 1))
+          fi
+        done
+
+        echo "::endgroup::"
+
+        if [ "$CHECKED" -eq 0 ]; then
+          echo "⚠️  No nginx server configs found — skipping check"
+          exit 0
+        fi
+
+        echo ""
+        echo "Checked $CHECKED nginx config(s): $((CHECKED - FAILED)) passed, $FAILED failed"
+
+        if [ "$FAILED" -gt 0 ]; then
+          echo ""
+          echo "::error::$FAILED nginx config(s) missing security baseline. Add this line inside each server block:"
+          echo "::error::    include $SNIPPET_PATH;"
+          exit 1
+        fi
+
+    - name: Check Dockerfile for security setup
+      if: inputs.check-fail2ban == 'true'
+      shell: bash
+      run: |
+        echo "::group::Scanning Dockerfiles for security setup"
+
+        DOCKERFILES=$(find . -type f -name "Dockerfile*" \
+          -not -path "*/node_modules/*" \
+          -not -path "*/.git/*" \
+          2>/dev/null || true)
+
+        FAILED=0
+        CHECKED=0
+
+        for df in $DOCKERFILES; do
+          # Only check Dockerfiles that install nginx
+          if ! grep -qE "(nginx|FROM.*nginx)" "$df" 2>/dev/null; then
+            continue
+          fi
+
+          CHECKED=$((CHECKED + 1))
+
+          # Check that security snippet is copied in
+          if grep -q "security-hardening" "$df"; then
+            echo "✅ $df — copies security snippet"
+          else
+            echo "❌ $df — MISSING security snippet COPY"
+            echo "   Expected: COPY security-hardening.conf /etc/nginx/snippets/security-hardening.conf"
+            FAILED=$((FAILED + 1))
+          fi
+        done
+
+        echo "::endgroup::"
+
+        if [ "$CHECKED" -eq 0 ]; then
+          echo "⚠️  No nginx Dockerfiles found — skipping check"
+          exit 0
+        fi
+
+        echo ""
+        echo "Checked $CHECKED Dockerfile(s): $((CHECKED - FAILED)) passed, $FAILED failed"
+
+        if [ "$FAILED" -gt 0 ]; then
+          echo "::error::$FAILED Dockerfile(s) missing security hardening snippet."
+          exit 1
+        fi
